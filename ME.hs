@@ -6,6 +6,9 @@ import Control.Exception
 import Test.QuickCheck
 import Data.Ord (comparing)
 import Data.List (sortBy, sortOn)
+import Basement.Compat.Base (otherwise, Bool (True))
+
+
 
 type Quantity = Int
 type Price = Int
@@ -188,7 +191,9 @@ handleNewOrder o ob = let
           (ob, [])
 
 
--- HERE GOES GENERATORS -- 
+-- *** --          -- *** --
+-- Instances of arbitrary -- 
+-- *** --          -- *** --
 
 instance Arbitrary OrderBook where
     arbitrary = genOrderBook
@@ -196,7 +201,16 @@ instance Arbitrary OrderBook where
 instance Arbitrary Order where
     arbitrary = genRandomOrder
 
+-- *** --            -- *** --
+-- New types to use in code -- 
+-- *** --            -- *** --
+
 type MinimumQuantity = Maybe Quantity
+type OrderList = [Order]
+
+-- *** --                                   -- *** --
+-- Generators that generate attributes of an Order --
+-- *** --                                   -- *** --
 
 genMinQty :: Gen MinimumQuantity
 genMinQty = elements list
@@ -205,7 +219,6 @@ genMinQty = elements list
 genQtyandMinQty :: Gen (Quantity, MinimumQuantity)
 genQtyandMinQty = elements list
     where list = [(a, Nothing) | a <- [1..1000]] ++ [(a, Just b) | a <- [1..1000], b <- [1..1000], a >= b]
-
 
 genOnlyBuySide :: Gen Side
 genOnlyBuySide = elements [Buy]
@@ -223,6 +236,10 @@ genIDs = elements list
 genPrice :: Gen Price
 genPrice = elements list
     where list = [a | a <- [1..1000]]
+
+-- *** --                                                         -- *** --
+-- Generators to generate buy order, sell order, and just a random order --
+-- *** --                                                         -- *** --
 
 genOnlyBuyOrder :: Gen Order
 genOnlyBuyOrder = do oid <- genIDs
@@ -245,6 +262,20 @@ genRandomOrder = do oid <- genIDs
                     (quantity , minQty) <- genQtyandMinQty
                     return (LimitOrder oid price quantity side minQty)
 
+-- *** --             -- *** --
+-- Generate a list of orders --
+-- *** --             -- *** --
+
+genOrderList :: Gen OrderList
+genOrderList = listOf genRandomOrder `suchThat` orderListLen 
+
+orderListLen :: OrderList -> Bool
+orderListLen ordList = length ordList >= 6
+
+-- *** --                                                               -- *** --
+-- Generate buy queue, sell queue, and order book based on previous generators --
+-- *** --                                                               -- *** --
+
 genBuyQueue :: Gen OrderQueue
 genBuyQueue = listOf genOnlyBuyOrder `suchThat` isBuyQueueSorted
 
@@ -255,6 +286,10 @@ genOrderBook :: Gen OrderBook
 genOrderBook = do buyQ <- genBuyQueue
                   sellQ <- genSellQueue
                   return (OrderBook buyQ sellQ)
+
+-- *** --                                                         -- *** --
+-- These generators are used to generate sorted buy queue and sell queue -- 
+-- *** --                                                         -- *** --
 
 getOrderPrice :: Order -> Price
 getOrderPrice = price
@@ -281,7 +316,21 @@ instance Arbitrary Trade where
         Positive sellId <- arbitrary
         return $ Trade priceTraded quantityTraded buyId sellId
 
+-- *** --                                                                -- *** --
+-- Match a list of orders recursively. First we begin with an empty order book. --
+-- *** --                                                                -- *** --
+
+matchListOfOrders :: OrderList -> OrderBook -> [Trade] -> (OrderBook, [Trade])
+matchListOfOrders [] ob trds = (ob, trds)
+matchListOfOrders [ord] ob trds = let (newOb, newTrds) = matchNewOrder ord ob 
+                                  in (newOb, trds ++ newTrds)
+matchListOfOrders (ord:remOrdsList) ob trds = let (newOb, newTrds) = matchNewOrder ord ob
+                                                  updatedTrds = trds ++ newTrds
+                                              in matchListOfOrders remOrdsList newOb updatedTrds 
+
+-- *** --                     -- *** --
 -- Conservation of quantity property --
+-- *** --                     -- *** --
 
 -- 1. Auxiliary functions
 getTradesQuantitySum :: [Trade] -> Int
@@ -315,8 +364,29 @@ prop_quantitySumEqual_Classified:: Order -> OrderBook -> Property
 prop_quantitySumEqual_Classified newOrder orderBook = collect (length trades) $ quantitySumEquityCheck newOrder orderBook
     where (remainOrderBook, trades) = matchNewOrder newOrder orderBook
 
+-- 3. Property check functions for new case of generators
 
+newQuantitySumEquityCheck :: Order -> OrderList -> Bool
+newQuantitySumEquityCheck newOrder newOrderList = quantity newOrder + getOrderBookQuantitySum organicOrderBook == 
+                                                  getOrderBookQuantitySum finalOrderBook + 2 * getTradesQuantitySum trades
+    where (organicOrderBook, organicTrades) = matchListOfOrders newOrderList primeOb primeTrds
+          primeOb = OrderBook [] []
+          primeTrds = []
+          (finalOrderBook, trades) = matchNewOrder newOrder organicOrderBook
+
+prop_newQuantitySumEqual_Classified:: Order -> OrderList -> Property
+prop_newQuantitySumEqual_Classified newOrder newOrderList = collect (length trades) $ 
+                                                            newQuantitySumEquityCheck newOrder newOrderList
+    where (organicOrderBook, organicTrades) = matchListOfOrders newOrderList primeOb primeTrds
+          primeOb = OrderBook [] []
+          primeTrds = []
+          (finalOrderBook, trades) = matchNewOrder newOrder organicOrderBook
+
+
+
+-- *** --                                                    -- *** --
 -- Heads of sell queue and buy queue can be matched or not property --
+-- *** --                                                    -- *** --
 
 -- 1. Auxiliary functions
 ordersCantBeMatched :: Order -> Order -> Bool
@@ -334,17 +404,36 @@ canHeadsMatchAfter newOrder orderBook = orderBookNotNull remainOrderBook
           buyHead = head $ buyQueue remainOrderBook
           sellHead = head $ sellQueue remainOrderBook
 
-canHeadsMatchBefore :: OrderBook -> Bool
-canHeadsMatchBefore orderBook = ordersCantBeMatched buyHead sellHead
+canHeadsMatchGeneral :: OrderBook -> Bool
+canHeadsMatchGeneral orderBook
+    | null (buyQueue orderBook) = True
+    | null (sellQueue orderBook) = True
+    | otherwise = ordersCantBeMatched buyHead sellHead
     where buyHead = head $ buyQueue orderBook
           sellHead = head $ sellQueue orderBook
 
 -- 2. Property check function
 prop_canHeadsMatch :: Order -> OrderBook -> Property
-prop_canHeadsMatch newOrder orderBook = orderBookNotNull orderBook &&  canHeadsMatchBefore orderBook ==> canHeadsMatchAfter newOrder orderBook
+prop_canHeadsMatch newOrder orderBook = orderBookNotNull orderBook &&  
+                                        canHeadsMatchGeneral orderBook ==> 
+                                        canHeadsMatchAfter newOrder orderBook
 
 
+-- 3. Property check functions for new case
+
+prop_newCanHeadsMatch :: Order -> OrderList -> Property
+prop_newCanHeadsMatch newOrder newOrderList = collect (length trades) $ 
+                                              canHeadsMatchGeneral finalOrderBook
+    where (organicOrderBook, organicTrades) = matchListOfOrders newOrderList primeOb primeTrds
+          primeOb = OrderBook [] []
+          primeTrds = []
+          (finalOrderBook, trades) = matchNewOrder newOrder organicOrderBook
+
+
+
+-- *** --                                -- *** --
 -- Compare trades price with sell and buy queue --
+-- *** --                                -- *** --
 
 tradePriceMoreThanBuyLessThanSell :: Order -> OrderBook -> Bool
 tradePriceMoreThanBuyLessThanSell newOrder orderBook = if side newOrder == Buy then headTradePrice <= sellHeadPrice else headTradePrice >= buyHeadPrice
@@ -353,6 +442,17 @@ tradePriceMoreThanBuyLessThanSell newOrder orderBook = if side newOrder == Buy t
           headTradePrice = if null trades then nullTradePrice else priceTraded (last trades)
           buyHeadPrice = if null $ buyQueue remainOrderBook then 0 else price (head $ buyQueue remainOrderBook)
           sellHeadPrice = if null $ sellQueue remainOrderBook then 1000 else price (head $ sellQueue remainOrderBook)
+
+tradePriceMoreThanBuyLessThanSell' :: Trade -> OrderBook -> Side -> Bool
+tradePriceMoreThanBuyLessThanSell' trd ob side
+    | null (sellQueue ob) && side == Buy = True
+    | null (buyQueue ob) && side == Sell = True
+    | otherwise = if side == Buy 
+                  then tradePrice <= sellHeadPrice 
+                  else tradePrice >= buyHeadPrice
+    where buyHeadPrice = price (head $ buyQueue ob)
+          sellHeadPrice = price (head $ sellQueue ob)
+          tradePrice = priceTraded trd
 
 prop_tradePriceCompareWithHeads_mbls :: Order -> OrderBook -> Property
 prop_tradePriceCompareWithHeads_mbls newOrder orderBook = orderBookNotNull orderBook &&
@@ -365,6 +465,16 @@ prop_tradePriceCompareWithHeads_simple_mbls :: Order -> OrderBook -> Bool
 prop_tradePriceCompareWithHeads_simple_mbls newOrder orderBook = tradePriceMoreThanBuyLessThanSell newOrder orderBook
     where (remainOrderBook, trades) = matchNewOrder newOrder orderBook
 
+prop_newTradePriceCompareWithHeads_Classified :: Order -> OrderList -> Property
+prop_newTradePriceCompareWithHeads_Classified newOrder newOrderList = collect (length trades) $ 
+                                                                       null trades || 
+                                                                       tradePriceMoreThanBuyLessThanSell' lastTrade finalOrderBook lastSide
+    where (organicOrderBook, organicTrades) = matchListOfOrders newOrderList primeOb primeTrds
+          primeOb = OrderBook [] []
+          primeTrds = []
+          (finalOrderBook, trades) = matchNewOrder newOrder organicOrderBook
+          lastTrade = last trades 
+          lastSide = side newOrder
 
 
 
